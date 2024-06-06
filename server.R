@@ -1,0 +1,217 @@
+library(shiny)
+library(reticulate)
+library(openxlsx)
+library(dplyr)
+library(heatmaply)
+library(plotly)
+
+# Ensure the correct Conda environment is used
+use_condaenv("rdkit-env", required = TRUE)
+
+# Source the Python script
+source_python("convert_smiles.py")
+
+# Add resource path for custom directory (if not using 'www')
+addResourcePath("static", "www")
+
+shinyServer(function(input, output, session) {
+  data <- reactiveVal(NULL)
+  current_page <- reactiveVal(1)
+  image_paths <- reactiveVal(list())
+
+  observeEvent(input$file, {
+    req(input$file)
+
+    # Read the Excel file with the first row as headers using openxlsx
+    df <- read.xlsx(input$file$datapath, sheet = 1, colNames = TRUE)
+
+    # Print the first few rows of the dataframe
+    print("First few rows of the data frame (raw):")
+    print(head(df))
+
+    # Print column names and types
+    print("Column Names:")
+    print(names(df))
+    print("Column Types:")
+    print(sapply(df, class))
+
+    # Ensure there are at least two columns
+    if (ncol(df) < 2) {
+      stop("The uploaded file does not contain the expected number of columns.")
+    }
+
+    # Convert all columns to character type
+    df <- df %>% mutate(across(everything(), as.character))
+
+    print("Data Frame After Conversion to Character:")
+    print(head(df))
+
+    # Check for correct column types after conversion
+    print("Column Types After Conversion:")
+    print(sapply(df, class))
+
+    data(df)
+    current_page(1)
+  })
+
+  observeEvent(input$convert, {
+    req(data())
+    df <- data()
+
+    # Generate molecule images for all rows
+    paths <- list()
+    for (i in seq_len(nrow(df))) {
+      row <- df[i, ]
+      smiles_string <- row[[1]]  # First column contains SMILES
+      output_file <- paste0("www/molecule_", i, ".png")
+
+      tryCatch({
+        smiles_to_png(smiles_string, output_file)
+        key <- paste0(row$BARCODE, "_", row$Cell.line)
+        paths[[key]] <- paste0("static/molecule_", i, ".png")  # Use combination of BARCODE and Cell.line as key
+        print(paste("Saved molecule image:", output_file, "for key:", key))
+      }, error = function(e) {
+        print(paste("Error with molecule", i, ":", e$message))
+      })
+    }
+
+    print("Generated image paths:")
+    print(paths)
+    image_paths(paths)
+
+    # Render the first page of molecules
+    current_page(1)
+    render_molecule_images()
+  })
+
+  render_molecule_images <- function() {
+    req(data())
+    df <- data()
+    page_size <- input$page_size
+    start <- (current_page() - 1) * page_size + 1
+    end <- min(current_page() * page_size, nrow(df))
+    current_data <- df[start:end, ]
+
+    output$molecule_images <- renderUI({
+      tagList(lapply(seq_len(nrow(current_data)), function(i) {
+        row <- current_data[i, ]
+        metadata <- row[-1]  # All other columns are metadata
+        output_file <- paste0("static/molecule_", start + i - 1, ".png")
+
+        metadata_display <- lapply(names(metadata), function(name) {
+          tags$p(paste(name, ":", metadata[[name]]))
+        })
+        list(
+          tags$h3(paste("Molecule", start + i - 1)),
+          tags$img(src = output_file, alt = paste("Molecule", start + i - 1)),
+          metadata_display
+        )
+      }))
+    })
+  }
+
+  observeEvent(input$prev_page, {
+    if (current_page() > 1) {
+      current_page(current_page() - 1)
+      render_molecule_images()
+    }
+  })
+
+  observeEvent(input$next_page, {
+    req(data())
+    if (current_page() * input$page_size < nrow(data())) {
+      current_page(current_page() + 1)
+      render_molecule_images()
+    }
+  })
+
+  output$page_info <- renderText({
+    req(data())
+    paste("Page", current_page(), "of", ceiling(nrow(data()) / input$page_size))
+  })
+
+  observeEvent(input$create_heatmap, {
+    req(data())
+    df <- data()
+
+    # Check necessary columns
+    if (!all(c("Condensed.Activity", "Cell.line", "BARCODE") %in% colnames(df))) {
+      return(NULL)
+    }
+
+    df <- df %>%
+      mutate(Condensed.Activity = as.numeric(Condensed.Activity)) %>%
+      mutate(Condensed.Activity = ifelse(is.na(Condensed.Activity), 0, Condensed.Activity))  # Replace NA with 0
+
+    # Apply thresholding
+    threshold_value <- input$threshold_value
+    df <- df %>%
+      mutate(Condensed.Activity = ifelse(Condensed.Activity > threshold_value, threshold_value, Condensed.Activity)) %>%
+      mutate(Condensed.Activity = ifelse(Condensed.Activity < -threshold_value, -threshold_value, Condensed.Activity))
+
+    heatmap_data <- df %>% dcast(Cell.line ~ BARCODE, value.var = "Condensed.Activity", fun.aggregate = mean)
+    heatmap_data[is.na(heatmap_data)] <- 0  # Replace NA with 0
+    rownames(heatmap_data) <- heatmap_data$Cell.line
+    heatmap_data <- heatmap_data[,-1]
+
+    p <- heatmaply(
+      heatmap_data,
+      dendrogram = "both",
+      dist_method = "euclidean",
+      hclust_method = "average",
+      plot_method = "plotly",
+      colors = colorRampPalette(c("blue", "white", "red"))(100)
+    )
+
+    p <- event_register(p, 'plotly_click')
+
+    output$heatmap <- renderPlotly({
+      p
+    })
+  })
+
+  observeEvent(event_data("plotly_click"), {
+    click_data <- event_data("plotly_click")
+    if (is.null(click_data)) return(NULL)
+
+    barcode <- click_data$x
+    cell_line <- click_data$y
+
+    print(paste("Clicked barcode:", barcode, "Clicked cell line:", cell_line))
+
+    df <- data()
+    selected_row <- df %>%
+      filter(BARCODE == barcode, Cell.line == cell_line)
+
+    print("Selected row:")
+    print(selected_row)
+
+    output$heatmap_info <- renderText({
+      paste("BARCODE:", barcode, "\nCell Line:", cell_line, "\nSMILES:", selected_row$SMILES)
+    })
+
+    if (nrow(selected_row) > 0) {
+      smiles_string <- selected_row$SMILES
+      output_file <- paste0("www/selected_molecule.png")
+
+      tryCatch({
+        smiles_to_png(smiles_string, output_file)
+        output$selected_molecule <- renderUI({
+          tags$img(src = "static/selected_molecule.png", alt = "Selected Molecule")
+        })
+        print(paste("Displayed molecule image for SMILES:", smiles_string))
+      }, error = function(e) {
+        print(paste("Error generating molecule image:", e$message))
+        output$selected_molecule <- renderUI({
+          tags$p("Error generating molecule image.")
+        })
+      })
+    } else {
+      print("No data found for selected molecule.")
+      output$selected_molecule <- renderUI({
+        tags$p("No data found for selected molecule.")
+      })
+    }
+  })
+})
+
